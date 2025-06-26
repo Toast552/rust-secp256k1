@@ -13,9 +13,22 @@ use std;
 
 use crate::ffi::{self, CPtr};
 use crate::{
-    from_hex, schnorr, Error, Keypair, Message, PublicKey, Scalar, Secp256k1, SecretKey, Signing,
+    from_hex, schnorr, Error, Keypair, PublicKey, Scalar, Secp256k1, SecretKey, Signing,
     Verification, XOnlyPublicKey,
 };
+
+/// Serialized size (in bytes) of the aggregated nonce.
+/// The serialized form is used for transmitting or storing the aggregated nonce.
+pub const AGGNONCE_SERIALIZED_SIZE: usize = 66;
+
+/// Serialized size (in bytes) of an individual public nonce.
+/// The serialized form is used for transmission between signers.
+pub const PUBNONCE_SERIALIZED_SIZE: usize = 66;
+
+/// Serialized size (in bytes) of a partial signature.
+/// The serialized form is used for transmitting partial signatures to be
+/// aggregated into the final signature.
+pub const PART_SIG_SERIALIZED_SIZE: usize = 32;
 
 /// Musig parsing errors
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
@@ -141,7 +154,7 @@ impl fmt::Display for InvalidTweakErr {
 ///   for maximal mis-use resistance.
 /// * `pub_key`: [`PublicKey`] that we will use to create partial signature. The secnonce
 ///   output of this function cannot be used to sign for any other public key.
-/// * `msg`: Optional [`Message`] that will be signed later on. Provide this for maximal misuse resistance.
+/// * `msg`: Optional message that will be signed later on. Provide this for maximal misuse resistance.
 /// * `extra_rand`: Additional randomness for mis-use resistance. Provide this for maximal misuse resistance
 ///
 /// Remember that nonce reuse will immediately leak the secret key!
@@ -171,7 +184,7 @@ pub fn new_nonce_pair<C: Signing>(
     key_agg_cache: Option<&KeyAggCache>,
     sec_key: Option<SecretKey>,
     pub_key: PublicKey,
-    msg: Option<Message>,
+    msg: Option<&[u8; 32]>,
     extra_rand: Option<[u8; 32]>,
 ) -> (SecretNonce, PublicNonce) {
     let cx = secp.ctx().as_ptr();
@@ -244,9 +257,9 @@ impl fmt::Display for PartialSignature {
 impl core::str::FromStr for PartialSignature {
     type Err = ParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut res = [0u8; ffi::MUSIG_PART_SIG_SERIALIZED_LEN];
+        let mut res = [0u8; PART_SIG_SERIALIZED_SIZE];
         match from_hex(s, &mut res) {
-            Ok(ffi::MUSIG_PART_SIG_SERIALIZED_LEN) => PartialSignature::from_byte_array(&res),
+            Ok(PART_SIG_SERIALIZED_SIZE) => PartialSignature::from_byte_array(&res),
             _ => Err(ParseError::MalformedArg),
         }
     }
@@ -274,7 +287,7 @@ impl<'de> serde::Deserialize<'de> for PartialSignature {
             d.deserialize_bytes(super::serde_util::BytesVisitor::new(
                 "a raw MuSig2 partial signature",
                 |slice| {
-                    let bytes: &[u8; ffi::MUSIG_PART_SIG_SERIALIZED_LEN] =
+                    let bytes: &[u8; PART_SIG_SERIALIZED_SIZE] =
                         slice.try_into().map_err(|_| ParseError::MalformedArg)?;
 
                     Self::from_byte_array(bytes)
@@ -286,8 +299,8 @@ impl<'de> serde::Deserialize<'de> for PartialSignature {
 
 impl PartialSignature {
     /// Serialize a PartialSignature as a byte array.
-    pub fn serialize(&self) -> [u8; ffi::MUSIG_PART_SIG_SERIALIZED_LEN] {
-        let mut data = MaybeUninit::<[u8; ffi::MUSIG_PART_SIG_SERIALIZED_LEN]>::uninit();
+    pub fn serialize(&self) -> [u8; PART_SIG_SERIALIZED_SIZE] {
+        let mut data = MaybeUninit::<[u8; PART_SIG_SERIALIZED_SIZE]>::uninit();
         unsafe {
             if ffi::secp256k1_musig_partial_sig_serialize(
                 ffi::secp256k1_context_no_precomp,
@@ -308,9 +321,7 @@ impl PartialSignature {
     /// # Errors:
     ///
     /// - MalformedArg: If the signature [`PartialSignature`] is out of curve order
-    pub fn from_byte_array(
-        data: &[u8; ffi::MUSIG_PART_SIG_SERIALIZED_LEN],
-    ) -> Result<Self, ParseError> {
+    pub fn from_byte_array(data: &[u8; PART_SIG_SERIALIZED_SIZE]) -> Result<Self, ParseError> {
         let mut partial_sig = MaybeUninit::<ffi::MusigPartialSignature>::uninit();
         unsafe {
             if ffi::secp256k1_musig_partial_sig_parse(
@@ -585,7 +596,7 @@ impl KeyAggCache {
     /// * `session_secrand`: [`SessionSecretRand`] Uniform random identifier for this session. Each call to this
     ///   function must have a UNIQUE `session_secrand`.
     /// * `pub_key`: [`PublicKey`] of the signer creating the nonce.
-    /// * `msg`: [`Message`] that will be signed later on.
+    /// * `msg`: message that will be signed later on.
     /// * `extra_rand`: Additional randomness for mis-use resistance
     ///
     /// Example:
@@ -593,7 +604,7 @@ impl KeyAggCache {
     /// ```rust
     /// # #[cfg(feature = "std")]
     /// # #[cfg(feature = "rand")] {
-    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey, Message};
+    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey};
     /// # use secp256k1::musig::{KeyAggCache, SessionSecretRand};
     /// # let secp = Secp256k1::new();
     /// # let sk1 = SecretKey::new(&mut rand::rng());
@@ -605,9 +616,8 @@ impl KeyAggCache {
     /// // The session id must be sampled at random. Read documentation for more details.
     /// let session_secrand = SessionSecretRand::from_rng(&mut rand::rng());
     ///
-    /// let msg = Message::from_digest_slice(b"Public Message we want to sign!!").unwrap();
-    ///
     /// // Provide the current time for mis-use resistance
+    /// let msg = b"Public message we want to sign!!";
     /// let extra_rand : Option<[u8; 32]> = None;
     /// let (_sec_nonce, _pub_nonce) = key_agg_cache.nonce_gen(&secp, session_secrand, pub_key1, msg, extra_rand);
     /// # }
@@ -617,7 +627,7 @@ impl KeyAggCache {
         secp: &Secp256k1<C>,
         session_secrand: SessionSecretRand,
         pub_key: PublicKey,
-        msg: Message,
+        msg: &[u8; 32],
         extra_rand: Option<[u8; 32]>,
     ) -> (SecretNonce, PublicNonce) {
         // The secret key here is supplied as NULL. This is okay because we supply the
@@ -642,7 +652,7 @@ impl KeyAggCache {
 /// thing that can or should be done with this nonce is to call [`Session::partial_sign`],
 /// which will take ownership. This is to prevent accidental reuse of the nonce.
 ///
-/// See the warning on [`Self::dangerous_into_bytes`] for more information about
+/// See the warnings on [`Self::dangerous_into_bytes`] for more information about
 /// the risks of non-standard workflows.
 #[allow(missing_copy_implementations)]
 #[derive(Debug)]
@@ -673,14 +683,21 @@ impl SecretNonce {
     ///
     /// See <https://blockstream.com/2019/02/18/musig-a-new-multisignature-standard/>
     /// for more details about these risks.
-    pub fn dangerous_into_bytes(self) -> [u8; secp256k1_sys::MUSIG_SECNONCE_LEN] {
+    ///
+    /// # Warning:
+    ///
+    /// The underlying library, libsecp256k1, does not guarantee the byte format will be consistent
+    /// across versions or platforms. Special care should be taken to ensure the returned bytes are
+    /// only ever passed to `dangerous_from_bytes` from the same libsecp256k1 version, and the same
+    /// platform.
+    pub fn dangerous_into_bytes(self) -> [u8; secp256k1_sys::MUSIG_SECNONCE_SIZE] {
         self.0.dangerous_into_bytes()
     }
 
     /// Function to create a new [`SecretNonce`] from a 32 byte array.
     ///
-    /// Refer to the warning on [`SecretNonce::dangerous_into_bytes`] for more details.
-    pub fn dangerous_from_bytes(array: [u8; secp256k1_sys::MUSIG_SECNONCE_LEN]) -> Self {
+    /// Refer to the warnings on [`SecretNonce::dangerous_into_bytes`] for more details.
+    pub fn dangerous_from_bytes(array: [u8; secp256k1_sys::MUSIG_SECNONCE_SIZE]) -> Self {
         SecretNonce(ffi::MusigSecNonce::dangerous_from_bytes(array))
     }
 }
@@ -714,9 +731,9 @@ impl fmt::Display for PublicNonce {
 impl core::str::FromStr for PublicNonce {
     type Err = ParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut res = [0u8; ffi::MUSIG_PUBNONCE_SERIALIZED_LEN];
+        let mut res = [0u8; PUBNONCE_SERIALIZED_SIZE];
         match from_hex(s, &mut res) {
-            Ok(ffi::MUSIG_PUBNONCE_SERIALIZED_LEN) => PublicNonce::from_byte_array(&res),
+            Ok(PUBNONCE_SERIALIZED_SIZE) => PublicNonce::from_byte_array(&res),
             _ => Err(ParseError::MalformedArg),
         }
     }
@@ -744,7 +761,7 @@ impl<'de> serde::Deserialize<'de> for PublicNonce {
             d.deserialize_bytes(super::serde_util::BytesVisitor::new(
                 "a raw MuSig2 public nonce",
                 |slice| {
-                    let bytes: &[u8; ffi::MUSIG_PUBNONCE_SERIALIZED_LEN] =
+                    let bytes: &[u8; PUBNONCE_SERIALIZED_SIZE] =
                         slice.try_into().map_err(|_| ParseError::MalformedArg)?;
 
                     Self::from_byte_array(bytes)
@@ -756,8 +773,8 @@ impl<'de> serde::Deserialize<'de> for PublicNonce {
 
 impl PublicNonce {
     /// Serialize a PublicNonce
-    pub fn serialize(&self) -> [u8; ffi::MUSIG_PUBNONCE_SERIALIZED_LEN] {
-        let mut data = [0; ffi::MUSIG_PUBNONCE_SERIALIZED_LEN];
+    pub fn serialize(&self) -> [u8; PUBNONCE_SERIALIZED_SIZE] {
+        let mut data = [0; PUBNONCE_SERIALIZED_SIZE];
         unsafe {
             if ffi::secp256k1_musig_pubnonce_serialize(
                 ffi::secp256k1_context_no_precomp,
@@ -778,9 +795,7 @@ impl PublicNonce {
     /// # Errors:
     ///
     /// - MalformedArg: If the [`PublicNonce`] is 132 bytes, but out of curve order
-    pub fn from_byte_array(
-        data: &[u8; ffi::MUSIG_PUBNONCE_SERIALIZED_LEN],
-    ) -> Result<Self, ParseError> {
+    pub fn from_byte_array(data: &[u8; PUBNONCE_SERIALIZED_SIZE]) -> Result<Self, ParseError> {
         let mut pub_nonce = MaybeUninit::<ffi::MusigPubNonce>::uninit();
         unsafe {
             if ffi::secp256k1_musig_pubnonce_parse(
@@ -831,9 +846,9 @@ impl fmt::Display for AggregatedNonce {
 impl core::str::FromStr for AggregatedNonce {
     type Err = ParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut res = [0u8; ffi::MUSIG_AGGNONCE_SERIALIZED_LEN];
+        let mut res = [0u8; AGGNONCE_SERIALIZED_SIZE];
         match from_hex(s, &mut res) {
-            Ok(ffi::MUSIG_AGGNONCE_SERIALIZED_LEN) => AggregatedNonce::from_byte_array(&res),
+            Ok(AGGNONCE_SERIALIZED_SIZE) => AggregatedNonce::from_byte_array(&res),
             _ => Err(ParseError::MalformedArg),
         }
     }
@@ -861,7 +876,7 @@ impl<'de> serde::Deserialize<'de> for AggregatedNonce {
             d.deserialize_bytes(super::serde_util::BytesVisitor::new(
                 "a raw MuSig2 aggregated nonce",
                 |slice| {
-                    let bytes: &[u8; ffi::MUSIG_AGGNONCE_SERIALIZED_LEN] =
+                    let bytes: &[u8; AGGNONCE_SERIALIZED_SIZE] =
                         slice.try_into().map_err(|_| ParseError::MalformedArg)?;
 
                     Self::from_byte_array(bytes)
@@ -884,7 +899,7 @@ impl AggregatedNonce {
     /// ```rust
     /// # #[cfg(feature = "std")]
     /// # #[cfg(feature = "rand")] {
-    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey, Message};
+    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey};
     /// # use secp256k1::musig::{AggregatedNonce, KeyAggCache, SessionSecretRand};
     /// # let secp = Secp256k1::new();
     /// # let sk1 = SecretKey::new(&mut rand::rng());
@@ -895,7 +910,7 @@ impl AggregatedNonce {
     /// # let key_agg_cache = KeyAggCache::new(&secp, &[&pub_key1, &pub_key2]);
     /// // The session id must be sampled at random. Read documentation for more details.
     ///
-    /// let msg = Message::from_digest_slice(b"Public Message we want to sign!!").unwrap();
+    /// let msg = b"Public message we want to sign!!";
     ///
     /// let session_secrand1 = SessionSecretRand::from_rng(&mut rand::rng());
     /// let (_sec_nonce1, pub_nonce1) = key_agg_cache.nonce_gen(&secp, session_secrand1, pub_key1, msg, None);
@@ -941,8 +956,8 @@ impl AggregatedNonce {
     }
 
     /// Serialize a AggregatedNonce into a 66 bytes array.
-    pub fn serialize(&self) -> [u8; ffi::MUSIG_AGGNONCE_SERIALIZED_LEN] {
-        let mut data = [0; ffi::MUSIG_AGGNONCE_SERIALIZED_LEN];
+    pub fn serialize(&self) -> [u8; AGGNONCE_SERIALIZED_SIZE] {
+        let mut data = [0; AGGNONCE_SERIALIZED_SIZE];
         unsafe {
             if ffi::secp256k1_musig_aggnonce_serialize(
                 ffi::secp256k1_context_no_precomp,
@@ -963,9 +978,7 @@ impl AggregatedNonce {
     /// # Errors:
     ///
     /// - MalformedArg: If the byte slice is 66 bytes, but the [`AggregatedNonce`] is invalid
-    pub fn from_byte_array(
-        data: &[u8; ffi::MUSIG_AGGNONCE_SERIALIZED_LEN],
-    ) -> Result<Self, ParseError> {
+    pub fn from_byte_array(data: &[u8; AGGNONCE_SERIALIZED_SIZE]) -> Result<Self, ParseError> {
         let mut aggnonce = MaybeUninit::<ffi::MusigAggNonce>::uninit();
         unsafe {
             if ffi::secp256k1_musig_aggnonce_parse(
@@ -1042,14 +1055,14 @@ impl Session {
     /// * `secp` : [`Secp256k1`] context object initialized for signing
     /// * `key_agg_cache`: [`KeyAggCache`] to be used for this session
     /// * `agg_nonce`: [`AggregatedNonce`], the aggregate nonce
-    /// * `msg`: [`Message`] that will be signed later on.
+    /// * `msg`: message that will be signed later on.
     ///
     /// Example:
     ///
     /// ```rust
     /// # #[cfg(feature = "std")]
     /// # #[cfg(feature = "rand")] {
-    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey, Message};
+    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey};
     /// # use secp256k1::musig::{AggregatedNonce, KeyAggCache, Session, SessionSecretRand};
     /// # let secp = Secp256k1::new();
     /// # let sk1 = SecretKey::new(&mut rand::rng());
@@ -1060,7 +1073,7 @@ impl Session {
     /// # let key_agg_cache = KeyAggCache::new(&secp, &[&pub_key1, &pub_key2]);
     /// // The session id must be sampled at random. Read documentation for more details.
     ///
-    /// let msg = Message::from_digest_slice(b"Public Message we want to sign!!").unwrap();
+    /// let msg = b"Public message we want to sign!!";
     ///
     /// // Provide the current time for mis-use resistance
     /// let session_secrand1 = SessionSecretRand::from_rng(&mut rand::rng());
@@ -1086,7 +1099,7 @@ impl Session {
         secp: &Secp256k1<C>,
         key_agg_cache: &KeyAggCache,
         agg_nonce: AggregatedNonce,
-        msg: Message,
+        msg: &[u8; 32],
     ) -> Self {
         let mut session = MaybeUninit::<ffi::MusigSession>::uninit();
 
@@ -1185,7 +1198,7 @@ impl Session {
     /// # #[cfg(not(secp256k1_fuzz))]
     /// # #[cfg(feature = "std")]
     /// # #[cfg(feature = "rand")] {
-    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey, Message};
+    /// # use secp256k1::{Secp256k1, SecretKey, Keypair, PublicKey};
     /// # use secp256k1::musig::{AggregatedNonce, KeyAggCache, SessionSecretRand, Session};
     /// # let secp = Secp256k1::new();
     /// # let sk1 = SecretKey::new(&mut rand::rng());
@@ -1196,7 +1209,7 @@ impl Session {
     /// # let key_agg_cache = KeyAggCache::new(&secp, &[&pub_key1, &pub_key2]);
     /// // The session id must be sampled at random. Read documentation for more details.
     ///
-    /// let msg = Message::from_digest_slice(b"Public Message we want to sign!!").unwrap();
+    /// let msg = b"Public message we want to sign!!";
     ///
     /// // Provide the current time for mis-use resistance
     /// let session_secrand1 = SessionSecretRand::from_rng(&mut rand::rng());
@@ -1226,8 +1239,8 @@ impl Session {
     /// assert!(session.partial_verify(
     ///     &secp,
     ///     &key_agg_cache,
-    ///     partial_sig1,
-    ///     pub_nonce1,
+    ///     &partial_sig1,
+    ///     &pub_nonce1,
     ///     pub_key1,
     /// ));
     /// # }
@@ -1236,8 +1249,8 @@ impl Session {
         &self,
         secp: &Secp256k1<C>,
         key_agg_cache: &KeyAggCache,
-        partial_sig: PartialSignature,
-        pub_nonce: PublicNonce,
+        partial_sig: &PartialSignature,
+        pub_nonce: &PublicNonce,
         pub_key: PublicKey,
     ) -> bool {
         let cx = secp.ctx().as_ptr();
@@ -1266,7 +1279,7 @@ impl Session {
     ///
     /// ```rust
     /// # #[cfg(feature = "rand-std")] {
-    /// # use secp256k1::{KeyAggCache, Secp256k1, SecretKey, Keypair, PublicKey, SessionSecretRand, Message, AggregatedNonce, Session};
+    /// # use secp256k1::{KeyAggCache, Secp256k1, SecretKey, Keypair, PublicKey, SessionSecretRand, AggregatedNonce, Session};
     /// # let secp = Secp256k1::new();
     /// # let sk1 = SecretKey::new(&mut rand::rng());
     /// # let pub_key1 = PublicKey::from_secret_key(&secp, &sk1);
@@ -1276,7 +1289,7 @@ impl Session {
     /// let key_agg_cache = KeyAggCache::new(&secp, &[pub_key1, pub_key2]);
     /// // The session id must be sampled at random. Read documentation for more details.
     ///
-    /// let msg = Message::from_digest_slice(b"Public Message we want to sign!!").unwrap();
+    /// let msg = b"Public message we want to sign!!";
     ///
     /// // Provide the current time for mis-use resistance
     /// let session_secrand1 = SessionSecretRand::from_rng(&mut rand::rng());
@@ -1367,7 +1380,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "std")]
     #[cfg(feature = "rand")]
-    use crate::{Message, PublicKey, Secp256k1, SecretKey};
+    use crate::{PublicKey, Secp256k1, SecretKey};
 
     #[test]
     #[cfg(feature = "std")]
@@ -1476,8 +1489,7 @@ mod tests {
 
         let key_agg_cache = KeyAggCache::new(&secp, &[&pubkey1, &pubkey2]);
 
-        let msg_bytes: [u8; 32] = *b"this_could_be_the_hash_of_a_msg!";
-        let msg = Message::from_digest_slice(&msg_bytes).unwrap();
+        let msg: &[u8; 32] = b"This message is exactly 32 bytes";
 
         // Test nonce generation with KeyAggCache
         let session_secrand1 = SessionSecretRand::from_rng(&mut rng);
@@ -1516,8 +1528,7 @@ mod tests {
 
         let key_agg_cache = KeyAggCache::new(&secp, &[&pubkey1, &pubkey2]);
 
-        let msg_bytes: [u8; 32] = *b"this_could_be_the_hash_of_a_msg!";
-        let msg = Message::from_digest_slice(&msg_bytes).unwrap();
+        let msg: &[u8; 32] = b"This message is exactly 32 bytes";
 
         let session_secrand1 = SessionSecretRand::from_rng(&mut rng);
         let (_, pub_nonce1) = key_agg_cache.nonce_gen(&secp, session_secrand1, pubkey1, msg, None);
@@ -1566,8 +1577,7 @@ mod tests {
         let pubkeys = [&pubkey1, &pubkey2];
         let key_agg_cache = KeyAggCache::new(&secp, &pubkeys);
 
-        let msg_bytes: [u8; 32] = *b"this_could_be_the_hash_of_a_msg!";
-        let msg = Message::from_digest_slice(&msg_bytes).unwrap();
+        let msg: &[u8; 32] = b"This message is exactly 32 bytes";
 
         let session_secrand1 = SessionSecretRand::from_rng(&mut rng);
         let (sec_nonce1, pub_nonce1) =
@@ -1591,12 +1601,42 @@ mod tests {
         let partial_sign2 = session.partial_sign(&secp, sec_nonce2, &keypair2, &key_agg_cache);
 
         // Test partial signature verification
-        assert!(session.partial_verify(&secp, &key_agg_cache, partial_sign1, pub_nonce1, pubkey1));
-        assert!(session.partial_verify(&secp, &key_agg_cache, partial_sign2, pub_nonce2, pubkey2));
+        assert!(session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            &partial_sign1,
+            &pub_nonce1,
+            pubkey1
+        ));
+        assert!(session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            &partial_sign2,
+            &pub_nonce2,
+            pubkey2
+        ));
         // Test that they are invalid if you switch keys
-        assert!(!session.partial_verify(&secp, &key_agg_cache, partial_sign2, pub_nonce2, pubkey1));
-        assert!(!session.partial_verify(&secp, &key_agg_cache, partial_sign2, pub_nonce1, pubkey2));
-        assert!(!session.partial_verify(&secp, &key_agg_cache, partial_sign2, pub_nonce1, pubkey1));
+        assert!(!session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            &partial_sign2,
+            &pub_nonce2,
+            pubkey1
+        ));
+        assert!(!session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            &partial_sign2,
+            &pub_nonce1,
+            pubkey2
+        ));
+        assert!(!session.partial_verify(
+            &secp,
+            &key_agg_cache,
+            &partial_sign2,
+            &pub_nonce1,
+            pubkey1
+        ));
 
         // Test PartialSignature serialization/deserialization
         let serialized_partial_sig = partial_sign1.serialize();
@@ -1620,8 +1660,7 @@ mod tests {
         let pubkeys = [&pubkey1, &pubkey2];
         let key_agg_cache = KeyAggCache::new(&secp, &pubkeys);
 
-        let msg_bytes: [u8; 32] = *b"this_could_be_the_hash_of_a_msg!";
-        let msg = Message::from_digest_slice(&msg_bytes).unwrap();
+        let msg: &[u8; 32] = b"This message is exactly 32 bytes";
 
         let session_secrand1 = SessionSecretRand::from_rng(&mut rng);
         let (sec_nonce1, pub_nonce1) =
@@ -1644,23 +1683,23 @@ mod tests {
         // Test signature verification
         let aggregated_signature = session.partial_sig_agg(&[&partial_sign1, &partial_sign2]);
         let agg_pk = key_agg_cache.agg_pk();
-        aggregated_signature.verify(&secp, &agg_pk, &msg_bytes).unwrap();
+        aggregated_signature.verify(&secp, &agg_pk, msg).unwrap();
 
         // Test assume_valid
         let schnorr_sig = aggregated_signature.assume_valid();
-        secp.verify_schnorr(&schnorr_sig, &msg_bytes, &agg_pk).unwrap();
+        secp.verify_schnorr(&schnorr_sig, msg, &agg_pk).unwrap();
 
         // Test with wrong aggregate (repeated sigs)
         let aggregated_signature = session.partial_sig_agg(&[&partial_sign1, &partial_sign1]);
-        aggregated_signature.verify(&secp, &agg_pk, &msg_bytes).unwrap_err();
+        aggregated_signature.verify(&secp, &agg_pk, msg).unwrap_err();
         let schnorr_sig = aggregated_signature.assume_valid();
-        secp.verify_schnorr(&schnorr_sig, &msg_bytes, &agg_pk).unwrap_err();
+        secp.verify_schnorr(&schnorr_sig, msg, &agg_pk).unwrap_err();
 
         // Test with swapped sigs -- this will work. Unlike keys, sigs are not ordered.
         let aggregated_signature = session.partial_sig_agg(&[&partial_sign2, &partial_sign1]);
-        aggregated_signature.verify(&secp, &agg_pk, &msg_bytes).unwrap();
+        aggregated_signature.verify(&secp, &agg_pk, msg).unwrap();
         let schnorr_sig = aggregated_signature.assume_valid();
-        secp.verify_schnorr(&schnorr_sig, &msg_bytes, &agg_pk).unwrap();
+        secp.verify_schnorr(&schnorr_sig, msg, &agg_pk).unwrap();
     }
 
     #[test]
@@ -1680,8 +1719,7 @@ mod tests {
         let pubkeys_ref = pubkeys_ref.as_mut_slice();
 
         let key_agg_cache = KeyAggCache::new(&secp, pubkeys_ref);
-        let msg_bytes: [u8; 32] = *b"this_could_be_the_hash_of_a_msg!";
-        let msg = Message::from_digest_slice(&msg_bytes).unwrap();
+        let msg: &[u8; 32] = b"This message is exactly 32 bytes";
 
         let session_secrand1 = SessionSecretRand::from_rng(&mut rng);
         let (_, pub_nonce1) = key_agg_cache.nonce_gen(&secp, session_secrand1, pubkey1, msg, None);
