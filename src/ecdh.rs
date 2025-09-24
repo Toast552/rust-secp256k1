@@ -21,11 +21,9 @@ const SHARED_SECRET_SIZE: usize = constants::SECRET_KEY_SIZE;
 ///
 /// ```
 /// # #[cfg(all(feature = "rand", feature = "std"))] {
-/// # use secp256k1::{rand, Secp256k1};
-/// # use secp256k1::ecdh::SharedSecret;
-/// let s = Secp256k1::new();
-/// let (sk1, pk1) = s.generate_keypair(&mut rand::rng());
-/// let (sk2, pk2) = s.generate_keypair(&mut rand::rng());
+/// # use secp256k1::{rand, ecdh::SharedSecret};
+/// let (sk1, pk1) = secp256k1::generate_keypair(&mut rand::rng());
+/// let (sk2, pk2) = secp256k1::generate_keypair(&mut rand::rng());
 /// let sec1 = SharedSecret::new(&pk2, &sk1);
 /// let sec2 = SharedSecret::new(&pk1, &sk2);
 /// assert_eq!(sec1, sec2);
@@ -110,21 +108,18 @@ impl AsRef<[u8]> for SharedSecret {
 /// 64 bytes representing the (x,y) co-ordinates of a point on the curve (32 bytes each).
 ///
 /// # Examples
-/// ```
-/// # #[cfg(all(feature = "hashes", feature = "rand", feature = "std"))] {
-/// # use secp256k1::{ecdh, rand, Secp256k1, PublicKey, SecretKey};
-/// # use secp256k1::hashes::{Hash, sha512};
+/// ```ignore
+/// use bitcoin_hashes::{Hash, sha512};
+/// use secp256k1::{ecdh, rand, PublicKey, SecretKey};
 ///
-/// let s = Secp256k1::new();
-/// let (sk1, pk1) = s.generate_keypair(&mut rand::rng());
-/// let (sk2, pk2) = s.generate_keypair(&mut rand::rng());
+/// let (sk1, pk1) = crate::generate_keypair(&mut rand::rng());
+/// let (sk2, pk2) = crate::generate_keypair(&mut rand::rng());
 ///
 /// let point1 = ecdh::shared_secret_point(&pk2, &sk1);
 /// let secret1 = sha512::Hash::hash(&point1);
 /// let point2 = ecdh::shared_secret_point(&pk1, &sk2);
 /// let secret2 = sha512::Hash::hash(&point2);
 /// assert_eq!(secret1, secret2)
-/// # }
 /// ```
 pub fn shared_secret_point(point: &PublicKey, scalar: &SecretKey) -> [u8; 64] {
     let mut xy = [0u8; 64];
@@ -191,14 +186,11 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     use super::SharedSecret;
-    use crate::Secp256k1;
 
     #[test]
-    #[cfg(all(feature = "rand", feature = "std"))]
     fn ecdh() {
-        let s = Secp256k1::signing_only();
-        let (sk1, pk1) = s.generate_keypair(&mut rand::rng());
-        let (sk2, pk2) = s.generate_keypair(&mut rand::rng());
+        let (sk1, pk1) = crate::test_random_keypair();
+        let (sk2, pk2) = crate::test_random_keypair();
 
         let sec1 = SharedSecret::new(&pk2, &sk1);
         let sec2 = SharedSecret::new(&pk1, &sk2);
@@ -222,32 +214,6 @@ mod tests {
         new_y.copy_from_slice(&output[32..]);
         assert_eq!(x, new_x);
         assert_eq!(y, new_y);
-    }
-
-    #[test]
-    #[cfg(not(secp256k1_fuzz))]
-    #[cfg(all(feature = "hashes", feature = "rand", feature = "std"))]
-    fn hashes_and_sys_generate_same_secret() {
-        use hashes::{sha256, Hash, HashEngine};
-
-        use crate::ecdh::shared_secret_point;
-
-        let s = Secp256k1::signing_only();
-        let (sk1, _) = s.generate_keypair(&mut rand::rng());
-        let (_, pk2) = s.generate_keypair(&mut rand::rng());
-
-        let secret_sys = SharedSecret::new(&pk2, &sk1);
-
-        let xy = shared_secret_point(&pk2, &sk1);
-
-        // Mimics logic in `bitcoin-core/secp256k1/src/module/main_impl.h`
-        let version = (xy[63] & 0x01) | 0x02;
-        let mut engine = sha256::HashEngine::default();
-        engine.input(&[version]);
-        engine.input(&xy.as_ref()[..32]);
-        let secret_bh = sha256::Hash::from_engine(engine);
-
-        assert_eq!(secret_bh.as_byte_array(), secret_sys.as_ref());
     }
 
     #[test]
@@ -281,11 +247,9 @@ mod benches {
     use test::{black_box, Bencher};
 
     use super::SharedSecret;
-    use crate::Secp256k1;
 
     #[bench]
     pub fn bench_ecdh(bh: &mut Bencher) {
-        let s = Secp256k1::signing_only();
         let (sk, pk) = s.generate_keypair(&mut rand::rng());
 
         bh.iter(|| {

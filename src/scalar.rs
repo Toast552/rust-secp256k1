@@ -19,7 +19,7 @@ use crate::constants;
 ///
 /// **Warning: the operations on this type are NOT constant time!**
 /// Using this with secret values is not advised.
-// Internal represenation is big endian to match what `libsecp256k1` uses.
+// Internal representation is big endian to match what `libsecp256k1` uses.
 // Also easier to implement comparison.
 // Debug impl omitted for now, the bytes may be secret
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -106,6 +106,22 @@ impl Scalar {
 
         self.as_be_bytes().as_c_ptr()
     }
+
+    /// Constructor for unit testing.
+    #[cfg(test)]
+    #[cfg(all(feature = "rand", feature = "std"))]
+    pub fn test_random() -> Self { Self::random() }
+
+    /// Constructor for unit testing.
+    #[cfg(test)]
+    #[cfg(not(all(feature = "rand", feature = "std")))]
+    pub fn test_random() -> Self {
+        loop {
+            if let Ok(ret) = Self::from_be_bytes(crate::test_random_32_bytes()) {
+                return ret;
+            }
+        }
+    }
 }
 
 impl<I> ops::Index<I> for Scalar
@@ -119,7 +135,7 @@ where
 }
 
 impl From<crate::SecretKey> for Scalar {
-    fn from(value: crate::SecretKey) -> Self { Scalar(value.secret_bytes()) }
+    fn from(value: crate::SecretKey) -> Self { Scalar(value.to_secret_bytes()) }
 }
 
 /// Error returned when the value of scalar is invalid - larger than the curve order.
